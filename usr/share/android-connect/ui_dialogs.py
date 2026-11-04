@@ -1,3 +1,5 @@
+import queue
+import threading
 """
 Diálogos inteligentes do Android Connect 2.1 (Layout Ampliado e Auditado):
 - Mini editor de texto embutido (920x640)
@@ -12,7 +14,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from qt_compat import (
-    Qt, QWidget, QDialog, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    Qt, QApplication, QThread, QTimer, pyqtSignal, QWidget, QDialog, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTextEdit, QProgressBar, QRadioButton, QButtonGroup,
     QCheckBox, QTreeWidget, QTreeWidgetItem, QStackedWidget,
     QMessageBox, QScrollArea, QPixmap, load_svg_icon, exec_dialog
@@ -356,11 +358,20 @@ class GlobalSearchDialog(QDialog):
     def _do_search(self):
         term = self.search_edit.text().strip()
         if not term:
+            QMessageBox.warning(self, "Aviso", "Digite um nome para pesquisar.")
             return
         self.status.setText("Pesquisando em todas as subpastas...")
         self.tree.clear()
-        results = self.adb.global_search(self.base_dir, term, self.is_remote)
+        results = run_with_loading(
+            self,
+            "Pesquisando Arquivos",
+            f"Procurando por '{term}' nas subpastas...",
+            lambda _prog: self.adb.global_search(self.base_dir, term, self.is_remote),
+            total_steps=0
+        )
         self.status.setText(f"{len(results)} resultado(s) encontrado(s). Dê duplo clique para abrir o local.")
+        if not results:
+            QMessageBox.information(self, "Pesquisa Concluída", f"Nenhum item encontrado para '{term}'.")
         role = Qt.ItemDataRole.UserRole if hasattr(Qt, "ItemDataRole") else Qt.UserRole
         for r in results:
             it = QTreeWidgetItem([r.name, r.path])
@@ -664,3 +675,158 @@ class SettingsDialog(QDialog):
             "confirm_delete": self.confirm_del_chk.isChecked(),
         })
         self.accept()
+
+
+class LoadingProgressDialog(QDialog):
+    """
+    Pop-up de Carregamento Assíncrono com Progresso Real por Quantidade de Itens:
+    - Permite atualizar dinamicamente o total de arquivos após escanear subpastas
+    - Mostra porcentagem exata + contador (ex: "64% (32/50 itens)") na barra de progresso
+    """
+    def __init__(
+        self,
+        title: str,
+        initial_text: str,
+        task_fn: Callable[[Callable[..., None]], Any],
+        total_steps: int = 0,
+        parent=None
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setFixedSize(520, 235)
+        self.task_fn = task_fn
+        self.total_steps = int(total_steps)
+        self._pulse_val = 15
+        self._pulse_dir = 5
+        self._can_close = False
+
+        self.msg_queue: "queue.Queue[Tuple[int, int, str]]" = queue.Queue()
+        self.result: Any = None
+        self.error: Optional[BaseException] = None
+        self._worker_done = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+
+        card = QFrame(self)
+        card.setObjectName("LoginCard")
+        c_lay = QVBoxLayout(card)
+        c_lay.setContentsMargins(24, 22, 24, 22)
+        c_lay.setSpacing(12)
+
+        self.title_lbl = QLabel(title)
+        self.title_lbl.setStyleSheet("font-weight: bold; font-size: 16px; color: #38BDF8;")
+        self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter if hasattr(Qt, "AlignmentFlag") else Qt.AlignCenter)
+        c_lay.addWidget(self.title_lbl)
+
+        self.detail_lbl = QLabel(initial_text)
+        self.detail_lbl.setWordWrap(True)
+        self.detail_lbl.setStyleSheet("color: #E2E8F0; font-size: 13px;")
+        self.detail_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter if hasattr(Qt, "AlignmentFlag") else Qt.AlignCenter)
+        c_lay.addWidget(self.detail_lbl)
+
+        self.counter_lbl = QLabel("")
+        self.counter_lbl.setStyleSheet("color: #10B981; font-weight: bold; font-size: 12px;")
+        self.counter_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter if hasattr(Qt, "AlignmentFlag") else Qt.AlignCenter)
+        c_lay.addWidget(self.counter_lbl)
+
+        self.progress = QProgressBar(self)
+        self.progress.setMinimumHeight(22)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0 if self.total_steps > 0 else 15)
+        self.progress.setTextVisible(True)
+        c_lay.addWidget(self.progress)
+
+        layout.addWidget(card)
+
+        self._worker_thread = threading.Thread(target=self._run_worker, daemon=True)
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(45)
+        self.poll_timer.timeout.connect(self._on_timer_tick)
+
+    def report_progress(self, step: int, text: str = "", new_total: Optional[int] = None):
+        tot = int(new_total) if new_total is not None else self.total_steps
+        self.msg_queue.put((int(step), tot, str(text)))
+
+    def _run_worker(self):
+        try:
+            self.result = self.task_fn(self.report_progress)
+        except BaseException as exc:
+            self.error = exc
+        finally:
+            self._worker_done = True
+
+    def start_and_exec(self):
+        self.poll_timer.start()
+        self._worker_thread.start()
+        exec_dialog(self)
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=10.0)
+        self._drain_queue()
+
+    def _drain_queue(self):
+        while not self.msg_queue.empty():
+            try:
+                step, tot, detail_text = self.msg_queue.get_nowait()
+                if tot > 0:
+                    self.total_steps = tot
+                if detail_text:
+                    self.detail_lbl.setText(detail_text)
+                if self.total_steps > 0:
+                    clamped_step = max(0, min(step, self.total_steps))
+                    pct = int((clamped_step / max(1, self.total_steps)) * 100)
+                    self.progress.setTextVisible(True)
+                    self.progress.setValue(pct)
+                    self.counter_lbl.setText(f"Progresso: {clamped_step} de {self.total_steps} item(ns) ({pct}%)")
+            except Exception:
+                break
+
+    def _on_timer_tick(self):
+        self._drain_queue()
+        if self.total_steps <= 0 and not self._worker_done:
+            self._pulse_val += self._pulse_dir
+            if self._pulse_val >= 95:
+                self._pulse_val = 95
+                self._pulse_dir = -5
+            elif self._pulse_val <= 10:
+                self._pulse_val = 10
+                self._pulse_dir = 5
+            self.progress.setValue(self._pulse_val)
+
+        if self._worker_done:
+            self.poll_timer.stop()
+            self._can_close = True
+            self.progress.setValue(100)
+            self.accept()
+
+    def reject(self):
+        if self._can_close:
+            super().reject()
+
+
+def run_with_loading(
+    parent,
+    title: str,
+    initial_text: str,
+    task_fn: Callable[[Callable[..., None]], Any],
+    total_steps: int = 0
+) -> Any:
+    """
+    Abre o pop-up modal LoadingProgressDialog na thread principal enquanto
+    executa `task_fn(report_progress)` em segundo plano.
+    """
+    dlg = LoadingProgressDialog(
+        title=title,
+        initial_text=initial_text,
+        task_fn=task_fn,
+        total_steps=total_steps,
+        parent=parent
+    )
+    dlg.start_and_exec()
+    if dlg.error is not None:
+        raise dlg.error
+    return dlg.result
+

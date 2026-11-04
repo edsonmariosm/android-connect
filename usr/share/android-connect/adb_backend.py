@@ -495,6 +495,101 @@ class AdbController:
                         ))
         return results
 
+
+    def build_local_to_remote_plan(
+        self, entries: List[FileEntry], remote_dest_dir: str
+    ) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+        """
+        Expande pastas locais recursivamente para que a barra de progresso contabilize
+        cada arquivo individual dentro das pastas selecionadas.
+        Retorna: (lista_de_pastas_remotas_para_criar, lista_de_(arq_local, pasta_remota_destino, nome_exibicao))
+        """
+        remote_dirs_to_create: List[str] = []
+        file_tasks: List[Tuple[str, str, str]] = []
+        base_remote = remote_dest_dir.rstrip("/") or "/"
+
+        for entry in entries:
+            if not entry.is_dir or "::" in entry.path:
+                file_tasks.append((entry.path, base_remote, entry.name))
+                continue
+
+            src_root = Path(entry.path).resolve()
+            root_name = src_root.name
+            target_root_remote = f"{base_remote}/{root_name}"
+            remote_dirs_to_create.append(target_root_remote)
+
+            try:
+                for cur_root, dirs, files in os.walk(src_root):
+                    rel_dir = os.path.relpath(cur_root, src_root)
+                    if rel_dir == ".":
+                        cur_remote_dir = target_root_remote
+                        rel_prefix = root_name
+                    else:
+                        rel_posix = rel_dir.replace("\\", "/")
+                        cur_remote_dir = f"{target_root_remote}/{rel_posix}"
+                        rel_prefix = f"{root_name}/{rel_posix}"
+                        remote_dirs_to_create.append(cur_remote_dir)
+
+                    for f_name in sorted(files):
+                        local_f = os.path.join(cur_root, f_name)
+                        display_rel = f"{rel_prefix}/{f_name}"
+                        file_tasks.append((local_f, cur_remote_dir, display_rel))
+            except Exception:
+                # Fallback caso alguma subpasta tenha restricao de leitura
+                file_tasks.append((entry.path, base_remote, entry.name))
+
+        return remote_dirs_to_create, file_tasks
+
+    def build_remote_to_local_plan(
+        self, entries: List[FileEntry], local_dest_dir: str
+    ) -> Tuple[List[str], List[Tuple[str, str, str]]]:
+        """
+        Expande pastas remotas do Android recursivamente via `find` para que a barra de
+        progresso avance arquivo por arquivo dentro de cada pasta.
+        Retorna: (lista_de_pastas_locais_para_criar, lista_de_(arq_remoto, arq_ou_pasta_local, nome_exibicao))
+        """
+        local_dirs_to_create: List[str] = []
+        file_tasks: List[Tuple[str, str, str]] = []
+        base_local = os.path.abspath(local_dest_dir)
+
+        for entry in entries:
+            if not entry.is_dir or "::" in entry.path or not self.device_serial:
+                file_tasks.append((entry.path, base_local, entry.name))
+                continue
+
+            remote_root = entry.path.rstrip("/")
+            root_name = entry.name
+            target_root_local = os.path.join(base_local, root_name)
+            local_dirs_to_create.append(target_root_local)
+
+            ok_d, out_d = self.run_android_shell(f"find {shlex.quote(remote_root)} -type d 2>/dev/null", timeout=25)
+            if ok_d and out_d:
+                for line in out_d.splitlines():
+                    d_path = line.strip()
+                    if d_path.startswith(remote_root):
+                        rel = d_path[len(remote_root):].lstrip("/")
+                        if rel:
+                            local_dirs_to_create.append(os.path.join(target_root_local, rel))
+
+            ok_f, out_f = self.run_android_shell(f"find {shlex.quote(remote_root)} -type f 2>/dev/null", timeout=30)
+            if ok_f and out_f.strip():
+                for line in out_f.splitlines():
+                    f_path = line.strip()
+                    if not f_path or not f_path.startswith(remote_root):
+                        continue
+                    rel = f_path[len(remote_root):].lstrip("/")
+                    if not rel:
+                        continue
+                    dest_file_local = os.path.join(target_root_local, rel)
+                    local_dirs_to_create.append(os.path.dirname(dest_file_local))
+                    file_tasks.append((f_path, dest_file_local, f"{root_name}/{rel}"))
+            else:
+                # Pasta vazia ou find indisponivel: mantem criacao da pasta / pull direto
+                if not ok_f:
+                    file_tasks.append((entry.path, base_local, entry.name))
+
+        return local_dirs_to_create, file_tasks
+
     def push_item(self, local_path: str, remote_dir: str) -> Tuple[bool, str]:
         if not self.device_serial:
             return False, "Celular desconectado."

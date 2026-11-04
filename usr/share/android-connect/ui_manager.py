@@ -18,7 +18,7 @@ from qt_compat import (
 from adb_backend import AdbController, FileEntry, get_private_runtime_dir
 from temp_watcher import LiveTempEditorManager
 from ui_dialogs import (
-    SettingsDialog, MiniTextEditorDialog, QuickPreviewDialog,
+    run_with_loading, SettingsDialog, MiniTextEditorDialog, QuickPreviewDialog,
     BatchRenameDialog, GlobalSearchDialog, PermissionChmodDialog
 )
 
@@ -286,7 +286,13 @@ class FilePaneWidget(QWidget):
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 safe_name = re.sub(r"[^a-zA-Z0-9._-]", "_", entry.name)
                 local_arch = str(cache_dir / safe_name)
-                ok, msg = self.adb.pull_item(entry.path, local_arch)
+                ok, msg = run_with_loading(
+                    self,
+                    "Abrindo Pacote",
+                    f"Baixando pacote '{entry.name}'...",
+                    lambda _prog: self.adb.pull_item(entry.path, local_arch),
+                    total_steps=0
+                )
                 if ok and os.path.isfile(local_arch):
                     self.navigate_to(f"{local_arch}::")
                 else:
@@ -305,9 +311,16 @@ class FilePaneWidget(QWidget):
         if not name.strip():
             QMessageBox.warning(self, "Nome Inválido", "O nome do documento não pode estar vazio.")
             return
-        success, msg = self.adb.create_empty_file(self.current_path, name.strip(), self.is_remote)
+        success, msg = run_with_loading(
+            self,
+            "Criando Documento",
+            f"Criando '{name.strip()}'...",
+            lambda _prog: self.adb.create_empty_file(self.current_path, name.strip(), self.is_remote),
+            total_steps=0
+        )
         if success:
             self.refresh()
+            QMessageBox.information(self, "Documento Criado", f"O documento '{name.strip()}' foi criado com sucesso.")
         else:
             QMessageBox.warning(self, "Não foi possível criar", msg)
 
@@ -629,82 +642,200 @@ class DualPaneManagerScreen(QWidget):
                 QMessageBox.critical(self, "Erro ao Salvar no Celular", msg)
         self.temp_editor.mark_prompt_finished(local_path)
 
-    def _execute_two_phase_batch_rename(self, plan: List[Tuple[FileEntry, str]], is_remote: bool) -> List[str]:
-        """Executa renomeação em lote em 2 fases para evitar colisão de nomes entre arquivos da lista."""
+    def _execute_two_phase_batch_rename(
+        self, plan: List[Tuple[FileEntry, str]], is_remote: bool, report_prog=None
+    ) -> List[str]:
+        """Executa renomeação em lote em 2 fases contabilizando cada etapa na barra de progresso."""
         errors: List[str] = []
         staging: List[Tuple[str, str, str]] = []
         token = uuid.uuid4().hex[:6]
+        total_ops = max(1, len(plan) * 2)
+        done_ops = 0
 
         for idx, (item, final_name) in enumerate(plan):
             if item.name == final_name:
+                done_ops += 2
+                if report_prog:
+                    report_prog(done_ops, f"Mantido: {item.name}", total_ops)
                 continue
             tmp_name = f"._ac_ren_{token}_{idx}_{final_name}"
             ok, msg = self.adb.rename_item(item.path, tmp_name, is_remote)
+            done_ops += 1
+            if report_prog:
+                report_prog(done_ops, f"Preparando: {item.name}", total_ops)
             if ok:
                 parent = os.path.dirname(item.path.rstrip("/"))
                 tmp_path = os.path.join(parent, tmp_name) if not is_remote else f"{parent.rstrip('/')}/{tmp_name}"
                 staging.append((tmp_path, final_name, item.name))
             else:
+                done_ops += 1
                 errors.append(f"{item.name}: {msg}")
 
         for tmp_path, final_name, orig_name in staging:
             ok, msg = self.adb.rename_item(tmp_path, final_name, is_remote)
+            done_ops += 1
+            if report_prog:
+                report_prog(done_ops, f"Renomeado: {orig_name} -> {final_name}", total_ops)
             if not ok:
                 self.adb.rename_item(tmp_path, orig_name, is_remote)
                 errors.append(f"{orig_name} -> {final_name}: {msg}")
 
         return errors
 
+    def _ask_yes_no(self, title: str, question: str) -> bool:
+        yes_btn = QMessageBox.StandardButton.Yes if hasattr(QMessageBox, "StandardButton") else QMessageBox.Yes
+        no_btn = QMessageBox.StandardButton.No if hasattr(QMessageBox, "StandardButton") else QMessageBox.No
+        return QMessageBox.question(self, title, question, yes_btn | no_btn) == yes_btn
+
     def _handle_action(self, action: str, entries: List[FileEntry], from_remote: bool):
         if action == "mkdir":
             pane = self.remote_pane if from_remote else self.local_pane
             name, ok = QInputDialog.getText(self, "Nova Pasta", "Nome da nova pasta:")
-            if ok and name.strip():
-                success, msg = self.adb.mkdir_item(pane.current_path, name.strip(), from_remote)
-                if not success:
-                    QMessageBox.warning(self, "Não foi possível criar a pasta", msg)
-                pane.refresh()
+            if not ok:
+                return
+            if not name.strip():
+                QMessageBox.warning(self, "Nome Inválido", "O nome da pasta não pode estar vazio.")
+                return
+            success, msg = run_with_loading(
+                self,
+                "Criando Pasta",
+                f"Criando pasta '{name.strip()}'...",
+                lambda _prog: self.adb.mkdir_item(pane.current_path, name.strip(), from_remote),
+                total_steps=0
+            )
+            pane.refresh()
+            if success:
+                QMessageBox.information(self, "Pasta Criada", f"A pasta '{name.strip()}' foi criada com sucesso.")
+            else:
+                QMessageBox.warning(self, "Não foi possível criar a pasta", msg)
             return
 
         if not entries:
+            QMessageBox.information(self, "Nenhum Item Selecionado", "Selecione pelo menos um arquivo ou pasta primeiro.")
             return
 
         if action == "copy":
             dest_pane = self.local_pane if from_remote else self.remote_pane
-            errors = []
-            for e in entries:
+            dest_label = "Computador" if from_remote else "Celular"
+            dest_dir = dest_pane.current_path
+            if not self._ask_yes_no(
+                "Confirmar Cópia",
+                f"Deseja copiar {len(entries)} item(ns) selecionado(s) (e todo o seu conteúdo interno) para o {dest_label}?"
+            ):
+                return
+
+            def copy_worker(report_prog):
+                report_prog(0, "Calculando quantidade de arquivos dentro das pastas...", 0)
+                errs = []
+                cnt = 0
                 if from_remote:
-                    ok, msg = self.adb.pull_item(e.path, dest_pane.current_path)
+                    local_dirs, file_tasks = self.adb.build_remote_to_local_plan(entries, dest_dir)
+                    for ld in local_dirs:
+                        try:
+                            os.makedirs(ld, exist_ok=True)
+                        except Exception as ex:
+                            errs.append(f"Pasta {ld}: {ex}")
+                    total_files = max(1, len(file_tasks))
+                    report_prog(0, f"Iniciando cópia de {len(file_tasks)} arquivo(s)...", total_files)
+                    for idx, (src_rem, dst_loc, disp_name) in enumerate(file_tasks, start=1):
+                        report_prog(idx - 1, f"Transferindo ({idx}/{total_files}): {disp_name}", total_files)
+                        ok, msg = self.adb.pull_item(src_rem, dst_loc)
+                        if ok:
+                            cnt += 1
+                        else:
+                            errs.append(f"{disp_name}: {msg}")
+                        report_prog(idx, f"Concluído ({idx}/{total_files}): {disp_name}", total_files)
                 else:
-                    ok, msg = self.adb.push_item(e.path, dest_pane.current_path)
-                if not ok:
-                    errors.append(f"{e.name}: {msg}")
+                    rem_dirs, file_tasks = self.adb.build_local_to_remote_plan(entries, dest_dir)
+                    for rd in rem_dirs:
+                        parent_rd = os.path.dirname(rd.rstrip("/")) or "/"
+                        folder_n = os.path.basename(rd.rstrip("/"))
+                        self.adb.mkdir_item(parent_rd, folder_n, is_remote=True)
+                    total_files = max(1, len(file_tasks))
+                    report_prog(0, f"Iniciando envio de {len(file_tasks)} arquivo(s)...", total_files)
+                    for idx, (src_loc, dst_rem_dir, disp_name) in enumerate(file_tasks, start=1):
+                        report_prog(idx - 1, f"Enviando ({idx}/{total_files}): {disp_name}", total_files)
+                        ok, msg = self.adb.push_item(src_loc, dst_rem_dir)
+                        if ok:
+                            cnt += 1
+                        else:
+                            errs.append(f"{disp_name}: {msg}")
+                        report_prog(idx, f"Concluído ({idx}/{total_files}): {disp_name}", total_files)
+                return cnt, errs
+
+            copied, errors = run_with_loading(
+                self, "Copiando Arquivos e Pastas", "Mapeando arquivos...", copy_worker, total_steps=0
+            )
             self.refresh_all()
             if errors:
-                QMessageBox.warning(self, "Aviso na Cópia", "\n".join(errors[:5]))
+                QMessageBox.warning(self, "Aviso na Cópia", f"{copied} arquivo(s) copiado(s), mas houve falhas:\n" + "\n".join(errors[:5]))
+            else:
+                QMessageBox.information(self, "Cópia Concluída", f"{copied} arquivo(s) transferido(s) com sucesso para o {dest_label}.")
 
         elif action == "move":
             dest_pane = self.local_pane if from_remote else self.remote_pane
-            errors = []
-            for e in entries:
+            dest_label = "Computador" if from_remote else "Celular"
+            dest_dir = dest_pane.current_path
+            if not self._ask_yes_no(
+                "Confirmar Movimentação",
+                f"Deseja mover {len(entries)} item(ns) selecionado(s) (e todo o seu conteúdo interno) para o {dest_label}?"
+            ):
+                return
+
+            def move_worker(report_prog):
+                report_prog(0, "Calculando quantidade de arquivos dentro das pastas...", 0)
+                errs = []
+                cnt = 0
                 if from_remote:
-                    ok, msg = self.adb.pull_item(e.path, dest_pane.current_path)
+                    local_dirs, file_tasks = self.adb.build_remote_to_local_plan(entries, dest_dir)
+                    for ld in local_dirs:
+                        try:
+                            os.makedirs(ld, exist_ok=True)
+                        except Exception as ex:
+                            errs.append(f"Pasta {ld}: {ex}")
+                    total_files = max(1, len(file_tasks))
+                    for idx, (src_rem, dst_loc, disp_name) in enumerate(file_tasks, start=1):
+                        report_prog(idx - 1, f"Movendo ({idx}/{total_files}): {disp_name}", total_files)
+                        ok, msg = self.adb.pull_item(src_rem, dst_loc)
+                        if ok:
+                            cnt += 1
+                        else:
+                            errs.append(f"{disp_name}: {msg}")
+                        report_prog(idx, f"Transferido ({idx}/{total_files}): {disp_name}", total_files)
                 else:
-                    ok, msg = self.adb.push_item(e.path, dest_pane.current_path)
-                if ok:
-                    ok_del, msg_del = self.adb.delete_item(e.path, from_remote)
-                    if not ok_del:
-                        errors.append(f"{e.name} (copiado, mas não removido da origem): {msg_del}")
-                else:
-                    errors.append(f"{e.name}: {msg}")
+                    rem_dirs, file_tasks = self.adb.build_local_to_remote_plan(entries, dest_dir)
+                    for rd in rem_dirs:
+                        parent_rd = os.path.dirname(rd.rstrip("/")) or "/"
+                        folder_n = os.path.basename(rd.rstrip("/"))
+                        self.adb.mkdir_item(parent_rd, folder_n, is_remote=True)
+                    total_files = max(1, len(file_tasks))
+                    for idx, (src_loc, dst_rem_dir, disp_name) in enumerate(file_tasks, start=1):
+                        report_prog(idx - 1, f"Movendo ({idx}/{total_files}): {disp_name}", total_files)
+                        ok, msg = self.adb.push_item(src_loc, dst_rem_dir)
+                        if ok:
+                            cnt += 1
+                        else:
+                            errs.append(f"{disp_name}: {msg}")
+                        report_prog(idx, f"Transferido ({idx}/{total_files}): {disp_name}", total_files)
+
+                # Remove as pastas/itens de origem apenas se nao houve falha na transferencia
+                if not errs:
+                    for e in entries:
+                        ok_del, msg_del = self.adb.delete_item(e.path, from_remote)
+                        if not ok_del:
+                            errs.append(f"{e.name} (transferido, mas não removido da origem): {msg_del}")
+                return cnt, errs
+
+            moved, errors = run_with_loading(
+                self, "Movendo Arquivos e Pastas", "Mapeando arquivos...", move_worker, total_steps=0
+            )
             self.refresh_all()
             if errors:
-                QMessageBox.warning(self, "Aviso ao Mover", "\n".join(errors[:5]))
+                QMessageBox.warning(self, "Aviso ao Mover", f"{moved} arquivo(s) transferido(s), mas houve avisos:\n" + "\n".join(errors[:5]))
+            else:
+                QMessageBox.information(self, "Movimentação Concluída", f"{moved} arquivo(s) movido(s) com sucesso para o {dest_label}.")
 
         elif action == "preview":
-            if not entries:
-                QMessageBox.information(self, "Aviso", "Selecione um arquivo para pré-visualizar.")
-                return
             e = entries[0]
             if e.is_dir:
                 QMessageBox.information(self, "Aviso", "Pastas não possuem pré-visualização; dê duplo clique para abrir.")
@@ -717,14 +848,20 @@ class DualPaneManagerScreen(QWidget):
             cleanup_after = False
 
             if "::" in e.path:
-                ok, res = self.adb.extract_archive_member(e.path, str(priv_dir))
+                ok, res = run_with_loading(
+                    self, "Carregando Pré-visualização", f"Extraindo '{e.name}'...",
+                    lambda _prog: self.adb.extract_archive_member(e.path, str(priv_dir)), total_steps=0
+                )
                 if not ok:
                     QMessageBox.warning(self, "Erro ao Abrir Item do Pacote", f"Não foi possível extrair para prévia: {res}")
                     return
                 p_to_show = res
                 cleanup_after = True
             elif from_remote:
-                ok, msg = self.adb.pull_item(e.path, tmp_p)
+                ok, msg = run_with_loading(
+                    self, "Carregando Pré-visualização", f"Baixando '{e.name}' do celular...",
+                    lambda _prog: self.adb.pull_item(e.path, tmp_p), total_steps=0
+                )
                 if not ok:
                     QMessageBox.warning(self, "Erro ao Baixar Arquivo", f"Não foi possível baixar para prévia: {msg}")
                     return
@@ -737,7 +874,7 @@ class DualPaneManagerScreen(QWidget):
                     return
 
             def open_externally():
-                self.on_double_click_file(e, from_remote)
+                self._handle_open_file(e, from_remote)
 
             dlg = QuickPreviewDialog(e, p_to_show, on_open_external_cb=open_externally, parent=self)
             exec_dialog(dlg)
@@ -758,7 +895,10 @@ class DualPaneManagerScreen(QWidget):
             tmp_p = str(priv_dir / f"edit_{clean_name}")
 
             if from_remote:
-                ok, msg = self.adb.pull_item(e.path, tmp_p)
+                ok, msg = run_with_loading(
+                    self, "Abrindo Editor", f"Baixando '{e.name}' do celular...",
+                    lambda _prog: self.adb.pull_item(e.path, tmp_p), total_steps=0
+                )
                 if not ok:
                     QMessageBox.warning(self, "Erro ao Baixar Arquivo", msg)
                     return
@@ -780,7 +920,10 @@ class DualPaneManagerScreen(QWidget):
                     with open(local_file, "w", encoding="utf-8") as f:
                         f.write(new_text)
                     if from_remote:
-                        ok_p, msg_p = self.adb.push_item(local_file, os.path.dirname(e.path))
+                        ok_p, msg_p = run_with_loading(
+                            self, "Salvando no Celular", f"Atualizando '{e.name}'...",
+                            lambda _prog: self.adb.push_item(local_file, os.path.dirname(e.path)), total_steps=0
+                        )
                         if not ok_p:
                             return False, msg_p
                     self.refresh_all()
@@ -800,53 +943,90 @@ class DualPaneManagerScreen(QWidget):
             if len(entries) == 1:
                 e = entries[0]
                 new_n, ok = QInputDialog.getText(self, "Renomear", "Novo nome:", text=e.name)
-                if ok and new_n.strip():
-                    success, msg = self.adb.rename_item(e.path, new_n.strip(), from_remote)
-                    if not success:
-                        QMessageBox.warning(self, "Erro ao Renomear", msg)
-                    self.refresh_all()
+                if not ok:
+                    return
+                if not new_n.strip():
+                    QMessageBox.warning(self, "Nome Inválido", "O novo nome não pode estar vazio.")
+                    return
+                success, msg = run_with_loading(
+                    self, "Renomeando", f"Renomeando '{e.name}' para '{new_n.strip()}'...",
+                    lambda _prog: self.adb.rename_item(e.path, new_n.strip(), from_remote), total_steps=0
+                )
+                self.refresh_all()
+                if success:
+                    QMessageBox.information(self, "Renomeação Concluída", f"Renomeado para '{new_n.strip()}' com sucesso.")
+                else:
+                    QMessageBox.warning(self, "Erro ao Renomear", msg)
             else:
                 dlg = BatchRenameDialog(entries, parent=self)
                 if exec_dialog(dlg):
                     plan = dlg.get_rename_plan()
-                    errors = self._execute_two_phase_batch_rename(plan, from_remote)
+                    if not self._ask_yes_no("Confirmar Renomeação em Lote", f"Deseja renomear {len(plan)} itens agora?"):
+                        return
+                    errors = run_with_loading(
+                        self, "Renomeando em Lote", "Aplicando novos nomes...",
+                        lambda prog: self._execute_two_phase_batch_rename(plan, from_remote, report_prog=prog), total_steps=len(plan) * 2
+                    )
                     self.refresh_all()
                     if errors:
                         QMessageBox.warning(self, "Avisos na Renomeação em Lote", "\n".join(errors[:5]))
+                    else:
+                        QMessageBox.information(self, "Renomeação Concluída", f"{len(plan)} itens foram renomeados com sucesso.")
 
         elif action == "chmod":
             dlg = PermissionChmodDialog(root_active=self.adb.root_enabled, parent=self)
             if exec_dialog(dlg):
                 octal = dlg.get_selected_octal()
-                errors = []
-                for e in entries:
-                    ok, msg = self.adb.chmod_item(e.path, octal, from_remote)
-                    if not ok:
-                        errors.append(f"{e.name}: {msg}")
+                if not self._ask_yes_no("Confirmar Permissão", f"Aplicar o nível de permissão selecionado em {len(entries)} item(ns)?"):
+                    return
+
+                def chmod_worker(report_prog):
+                    errs = []
+                    for idx, e in enumerate(entries, start=1):
+                        report_prog(idx, f"Atualizando ({idx}/{len(entries)}): {e.name}")
+                        ok, msg = self.adb.chmod_item(e.path, octal, from_remote)
+                        if not ok:
+                            errs.append(f"{e.name}: {msg}")
+                    return errs
+
+                errors = run_with_loading(
+                    self, "Aplicando Permissões", "Atualizando controle de acesso...", chmod_worker, total_steps=len(entries)
+                )
                 self.refresh_all()
                 if errors:
                     QMessageBox.warning(self, "Aviso de Permissão", "\n".join(errors[:5]))
+                else:
+                    QMessageBox.information(self, "Permissões Atualizadas", f"Controle de acesso atualizado em {len(entries)} item(ns).")
 
         elif action == "delete":
             if bool(self.settings.data.get("confirm_delete", True)):
-                yes_btn = QMessageBox.StandardButton.Yes if hasattr(QMessageBox, "StandardButton") else QMessageBox.Yes
-                no_btn = QMessageBox.StandardButton.No if hasattr(QMessageBox, "StandardButton") else QMessageBox.No
-                ans = QMessageBox.question(
-                    self, "Confirmar Exclusão", f"Deseja apagar {len(entries)} item(ns) selecionado(s)?", yes_btn | no_btn
-                )
-                if ans != yes_btn:
+                if not self._ask_yes_no("Confirmar Exclusão", f"Deseja realmente apagar {len(entries)} item(ns) selecionado(s)?"):
                     return
-            errors = []
-            for e in entries:
-                ok, msg = self.adb.delete_item(e.path, from_remote)
-                if not ok:
-                    errors.append(f"{e.name}: {msg}")
+
+            def del_worker(report_prog):
+                errs = []
+                cnt = 0
+                for idx, e in enumerate(entries, start=1):
+                    report_prog(idx, f"Apagando ({idx}/{len(entries)}): {e.name}")
+                    ok, msg = self.adb.delete_item(e.path, from_remote)
+                    if ok:
+                        cnt += 1
+                    else:
+                        errs.append(f"{e.name}: {msg}")
+                return cnt, errs
+
+            deleted, errors = run_with_loading(
+                self, "Apagando Itens", "Removendo itens selecionados...", del_worker, total_steps=len(entries)
+            )
             self.refresh_all()
             if errors:
                 QMessageBox.warning(self, "Erro ao Apagar", "\n".join(errors[:5]))
+            else:
+                QMessageBox.information(self, "Exclusão Concluída", f"{deleted} item(ns) apagado(s) com sucesso.")
 
         elif action == "delete_permanent":
             if not self.adb.root_enabled:
+                QMessageBox.warning(self, "Acesso Total Necessário", "Ative primeiro o botão Acesso Total no topo da janela.")
                 return
             yes_btn = QMessageBox.StandardButton.Yes if hasattr(QMessageBox, "StandardButton") else QMessageBox.Yes
             no_btn = QMessageBox.StandardButton.No if hasattr(QMessageBox, "StandardButton") else QMessageBox.No
@@ -857,11 +1037,23 @@ class DualPaneManagerScreen(QWidget):
                 yes_btn | no_btn
             )
             if ans == yes_btn:
-                errors = []
-                for e in entries:
-                    ok, msg = self.adb.delete_item(e.path, from_remote, permanent_root=True)
-                    if not ok:
-                        errors.append(f"{e.name}: {msg}")
+                def shred_worker(report_prog):
+                    errs = []
+                    cnt = 0
+                    for idx, e in enumerate(entries, start=1):
+                        report_prog(idx, f"Removendo ({idx}/{len(entries)}): {e.name}")
+                        ok, msg = self.adb.delete_item(e.path, from_remote, permanent_root=True)
+                        if ok:
+                            cnt += 1
+                        else:
+                            errs.append(f"{e.name}: {msg}")
+                    return cnt, errs
+
+                deleted, errors = run_with_loading(
+                    self, "Apagando Definitivamente", "Sobrescrevendo e removendo da memória...", shred_worker, total_steps=len(entries)
+                )
                 self.refresh_all()
                 if errors:
                     QMessageBox.critical(self, "Erro ao Apagar Definitivamente", "\n".join(errors[:5]))
+                else:
+                    QMessageBox.information(self, "Exclusão Definitiva Concluída", f"{deleted} item(ns) removido(s) permanentemente.")

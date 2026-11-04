@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+rm -rf /tmp/android_connect_live 2>/dev/null || true
+find /usr/share/android-connect -name "*.pyc" -delete 2>/dev/null || true
+find /usr/share/android-connect -name "__pycache__" -delete 2>/dev/null || true
+exit 0

@@ -50,7 +50,7 @@ O gerenciador de pacotes instalará automaticamente todas as dependências neces
 Clone o repositório e execute:
 
 ```bash
-git clone https://github.com/SEU_USUARIO/android-connect.git
+git clone https://github.com/edsonmariosm/android-connect.git
 cd android-connect
 python3 usr/share/android-connect/main.py
 ```

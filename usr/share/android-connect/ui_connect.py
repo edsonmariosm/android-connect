@@ -1,6 +1,7 @@
 """
 Tela de conexao e pareamento com layout ampliado.
 """
+from ui_dialogs import run_with_loading
 from qt_compat import (
     Qt, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QFrame, QDialog, QMessageBox, QComboBox, load_svg_icon, exec_dialog
@@ -100,14 +101,19 @@ class SixDigitPairDialog(QDialog):
         if not ip or not port or len(code) != 6:
             self.status_lbl.setText("Preencha o IP, a porta e todos os 6 dígitos.")
             return
-        self.status_lbl.setText("Vinculando celular...")
-        self.repaint()
-        ok, msg = self.adb.pair_device(ip, port, code)
+        ok, msg = run_with_loading(
+            self,
+            "Vinculando Celular",
+            f"Enviando código para {ip}:{port}...",
+            lambda _prog: self.adb.pair_device(ip, port, code),
+            total_steps=0
+        )
         if ok:
-            QMessageBox.information(self, "Celular Vinculado", msg)
+            QMessageBox.information(self, "Vinculação Concluída", msg)
             self.accept()
         else:
             self.status_lbl.setText(f"Erro: {msg}")
+            QMessageBox.warning(self, "Falha na Vinculação", msg)
 
 
 class ConnectionScreen(QWidget):
@@ -220,15 +226,21 @@ class ConnectionScreen(QWidget):
         if not ip:
             self.feedback.setText("Informe o endereço IP do celular.")
             return
-        self.feedback.setText(f"Conectando a {ip}:{port}...")
-        self.repaint()
-        ok, msg = self.adb.connect_device(ip, port)
+        ok, msg = run_with_loading(
+            self,
+            "Conectando ao Celular",
+            f"Estabelecendo conexão sem fio com {ip}:{port}...",
+            lambda _prog: self.adb.connect_device(ip, port),
+            total_steps=0
+        )
         if ok:
             if self.settings.data.get("auto_connect", True):
                 self.settings.save({"last_ip": ip, "default_port": port})
+            QMessageBox.information(self, "Conexão Confirmada", f"Conectado com sucesso ao celular em {ip}:{port}.")
             self.on_connected_callback(f"{ip}:{port}")
         else:
             self.feedback.setText(f"Não foi possível conectar: {msg}")
+            QMessageBox.warning(self, "Falha na Conexão", msg)
 
     def _use_device(self):
         s = self.dev_combo.currentData()

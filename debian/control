@@ -1,0 +1,18 @@
+Source: android-connect
+Section: utils
+Priority: optional
+Maintainer: edsonmariosm <edsonmariosm@gmail.com>
+Build-Depends: debhelper-compat (= 13), dh-python, python3
+Standards-Version: 4.6.2
+Homepage: https://github.com/edsonmariosm/android-connect
+
+Package: android-connect
+Architecture: all
+Depends: ${misc:Depends}, ${python3:Depends}, python3 (>= 3.8), python3-pyqt6 | python3-pyqt5, adb, xdg-utils
+Recommends: fonts-noto-color-emoji
+Description: Gerenciador Dual-Pane Inteligente e Conexao ADB Wi-Fi
+ Aplicacao grafica elegante estilo MT Manager com dois paineis (Computador e
+ Celular Android). Possui visualizacao de espaco em disco, abertura e inspecao
+ de pacotes .zip e .apk como pastas, busca global recursiva, renomeador em lote
+ com suporte a macros e ordenacao, mini editor de texto integrado, pre-visualizacao
+ rapida, comparador e sincronizacao de pastas, e modo Root condicional protegido.

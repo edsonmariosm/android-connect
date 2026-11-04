@@ -1,0 +1,15 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_install:
+	mkdir -p debian/android-connect/usr/bin
+	mkdir -p debian/android-connect/usr/share/android-connect
+	mkdir -p debian/android-connect/usr/share/applications
+	mkdir -p debian/android-connect/usr/share/icons/hicolor/scalable/apps
+	cp -r usr/bin/* debian/android-connect/usr/bin/
+	cp -r usr/share/android-connect/* debian/android-connect/usr/share/android-connect/
+	cp -r usr/share/applications/* debian/android-connect/usr/share/applications/
+	cp -r usr/share/icons/hicolor/scalable/apps/* debian/android-connect/usr/share/icons/hicolor/scalable/apps/
+	chmod 755 debian/android-connect/usr/bin/android-connect
+	chmod 755 debian/android-connect/usr/share/android-connect/main.py
