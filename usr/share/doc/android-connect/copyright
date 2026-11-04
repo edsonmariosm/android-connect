@@ -1,0 +1,6 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: android-connect
+Source: https://developer.android.com/tools/adb
+Files: *
+Copyright: 2026 Android Connect
+License: MIT

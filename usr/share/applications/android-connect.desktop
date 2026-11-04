@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Android Connect
+GenericName=Gerenciador ADB Wi-Fi
+Comment=Gerenciador Dual-Pane e conexao ADB sem fio estilo MT Manager
+Exec=/usr/bin/android-connect
+Icon=android-connect
+Terminal=false
+Categories=Utility;FileTools;System;Development;
+Keywords=adb;android;wifi;file;manager;root;mt;
+StartupNotify=true
